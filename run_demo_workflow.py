@@ -65,7 +65,8 @@ def toJSON(stats, seg_file, structure_map):
     import nibabel as nb
     import numpy as np
     img = nb.load(seg_file)
-    data = img.get_data()
+    data = img.get_fdata()
+    data = data.astype(int) # should be int
     voxel2vol = np.prod(img.header.get_zooms())
     idx = np.unique(data)
     reverse_map = {k:v for v, k in structure_map}
