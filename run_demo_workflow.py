@@ -11,52 +11,6 @@ from nipype import Workflow, Node, MapNode, Function
 from nipype.interfaces.fsl import BET, FAST, FIRST, Reorient2Std, ImageMaths, ImageStats
 from nipype.interfaces.io import DataSink
 
-def download_file(url):
-    """Download file for a given participant"""
-    import requests
-    import os
-    from time import sleep
-    num_retries = 5
-    URL = 'http://www.nitrc.org/ir/'
-    count = 0
-    while count < num_retries:
-        count += 1
-        session = requests.session()
-        r = session.get(URL)
-        if r.ok:
-            break
-        else:
-            sleep(10)
-            if count == num_retries:
-                raise IOError('Could not create a session for {}'.format(URL))
-    count = 0
-    while count < num_retries:
-        count += 1
-        local_filename = url.split('/')[-1]
-        r = session.get(url, stream=True, cookies=r.cookies)
-        if not r.ok:
-            if count == num_retries:
-                raise IOError('Could not GET {}'.format(url))
-            else:
-                sleep(5)
-                continue
-        with open(local_filename, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=1024):
-                if chunk: # filter out keep-alive new chunks
-                    f.write(chunk)
-        # verify that we can load the file
-        out_file = os.path.abspath(local_filename)
-        try:
-            import nibabel as nb
-            img = nb.load(out_file)
-        except Exception as e:
-            os.unlink(out_file)
-            if count == num_retries:
-                raise
-            sleep(5)
-        else:
-            break
-    return out_file
 
 def toJSON(stats, seg_file, structure_map):
     """Combine stats files to a single JSON file"""
@@ -81,19 +35,16 @@ def toJSON(stats, seg_file, structure_map):
     return os.path.abspath(out_file)
 
 
-def create_workflow(subject_id, outdir, file_url):
+def create_workflow(subject_id, outdir, input_file):
     """Create a workflow for a single participant"""
 
     sink_directory = os.path.join(outdir, subject_id)
     
-    wf = Workflow(name=subject_id)
-
-    getter = Node(Function(input_names=['url'], output_names=['localfile'],
-                           function=download_file), name="download_url")
-    getter.inputs.url = file_url
+    wf = Workflow(name=f"Workflow_{subject_id}")
 
     orienter = Node(Reorient2Std(), name='reorient_brain')
-    wf.connect(getter, 'localfile', orienter, 'in_file')
+    #wf.connect(getter, 'localfile', orienter, 'in_file')
+    orienter.inputs.in_file = input_file
 
     better = Node(BET(), name='extract_brain')
     wf.connect(orienter, 'out_file', better, 'in_file')
@@ -156,24 +107,26 @@ def create_workflow(subject_id, outdir, file_url):
 
     return wf
 
+
 if  __name__ == '__main__':
+    from pathlib import Path
     from argparse import ArgumentParser, RawTextHelpFormatter
     defstr = ' (default %(default)s)'
     parser = ArgumentParser(description=__doc__,
                             formatter_class=RawTextHelpFormatter)
-    parser.add_argument("--key", dest="key",
-                        help="google docs key")
     parser.add_argument("-o", "--output_dir", dest="sink_dir", default='output',
                         help="Sink directory base")
-    parser.add_argument("-w", "--work_dir", dest="work_dir",
+    parser.add_argument("-w", "--work_dir", dest="work_dir", default='workdir',
                         help="Output directory base")
-    parser.add_argument("-p", "--plugin", dest="plugin",
-                        default='MultiProc',
+    parser.add_argument("-p", "--plugin", dest="plugin", default='MultiProc',
                         help="Plugin to use")
     parser.add_argument("--plugin_args", dest="plugin_args",
                         help="Plugin arguments")
-    parser.add_argument("-n", dest="num_subjects", type=int,
-                        help="Number of subjects")
+    parser.add_argument("--dataset_dir", dest="dataset_dir", required=True,
+                        help="Path to dataset directory")
+    parser.add_argument("--subject_id", dest="subject_id", required=True,
+                        help="Subject ID, should be in the root of dataset directory")
+
     args = parser.parse_args()
 
     sink_dir = os.path.abspath(args.sink_dir)
@@ -182,42 +135,16 @@ if  __name__ == '__main__':
     else:
         work_dir = sink_dir
 
-    import sys
-    import requests
-    import pandas as pd
+    input_file = Path(args.dataset_dir) / args.subject_id / "anat" / f"{args.subject_id}_T1w.nii.gz"
 
-    #key = '11an55u9t2TAf0EV2pHN0vOd8Ww2Gie-tHp9xGULh_dA'
-    r = requests.get('https://docs.google.com/spreadsheets/d/{key}/export?format=csv&id={key}'.format(key=args.key))
-    if sys.version_info < (3,):
-        from StringIO import StringIO  # got moved to io in python3.
-        data = StringIO(r.content)
-    else:
-        from io import StringIO
-        data = StringIO(r.content.decode())
-
-    df = pd.read_csv(data)
-    max_subjects = df.shape[0]
-    if args.num_subjects:
-        max_subjects = args.num_subjects
-    elif ('CIRCLECI' in os.environ and os.environ['CIRCLECI'] == 'true'):
-        max_subjects = 1
-    
-    meta_wf = Workflow('metaflow')
-    count = 0
-    for row in df.iterrows():
-        wf = create_workflow(row[1].Subject, sink_dir, row[1]['File Path'])
-        meta_wf.add_nodes([wf])
-        print('Added workflow for: {}'.format(row[1].Subject))
-        count = count + 1
-        # run this for only one person on CircleCI
-        if count >= max_subjects:
-            break
-
-    meta_wf.base_dir = work_dir
-    meta_wf.config['execution']['remove_unnecessary_files'] = False
-    meta_wf.config['execution']['poll_sleep_duration'] = 2
-    meta_wf.config['execution']['crashdump_dir'] = work_dir
+    wf = create_workflow(args.subject_id, sink_dir, input_file=str(input_file))
+    wf.base_dir = work_dir
+    wf.config['execution']['remove_unnecessary_files'] = False
+    wf.config['execution']['poll_sleep_duration'] = 2
+    wf.config['execution']['crashdump_dir'] = work_dir
     if args.plugin_args:
-        meta_wf.run(args.plugin, plugin_args=eval(args.plugin_args))
+        wf.run(args.plugin, plugin_args=eval(args.plugin_args))
     else:
-        meta_wf.run(args.plugin)
+        wf.run(args.plugin)
+
+    print("Simple Workflow finished!!!")
